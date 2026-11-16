@@ -1,0 +1,61 @@
+"""Testes reais de RLS/constraints/triggers; somente contêiner local fictício."""
+import subprocess
+BASE=['docker','--host=unix:///var/run/docker.sock','exec','-i','cde-pcp-qa','psql','-U','postgres','-d','pdiqa','-X','-At','-v','ON_ERROR_STOP=1']
+passed=[]
+def sql(q,uid=None,role='authenticated',error=None,expect=None):
+    prefix=f"begin; set local role {role}; select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-{uid:012d}',true);" if uid else 'begin;'
+    p=subprocess.run(BASE,input=prefix+q+';commit;',text=True,capture_output=True)
+    if error:
+        assert p.returncode and error in p.stderr,(q,p.stdout,p.stderr)
+    else:
+        assert not p.returncode,(q,p.stdout,p.stderr)
+        if expect is not None: assert expect in p.stdout.splitlines(),(expect,p.stdout,p.stderr)
+    passed.append(q[:65]);return p.stdout
+sql("select (public.pdi_desempenho_context()->>'is_pcp')::bool",1,expect='t')
+sql("select jsonb_array_length(public.pdi_desempenho_context()->'pcps')",3,expect='2')
+sql("select jsonb_array_length(public.pdi_desempenho_context()->'pcps')",6,expect='3')
+sql("select (public.pdi_desempenho_context()->>'can_view_logs')::bool",3,expect='f')
+sql("select (public.pdi_desempenho_context()->>'can_view_logs')::bool",4,expect='t')
+sql("insert into public.pdi_pcp_daily(pcp_id,m2_saved,order_numbers) values(auth.uid(),12.345,array['00012','991'])",1)
+sql("select edit_reason from public.pdi_pcp_daily",1,error='permission denied')
+sql("select count(*) from public.pdi_performance_audit",1,expect='0')
+sql("select count(*) from public.pdi_performance_audit",3,expect='0')
+sql("select count(*) from public.pdi_performance_audit",4,expect='1')
+sql("select count(*) from public.pdi_performance_audit",5,expect='0')
+sql("select count(*) from public.pdi_performance_audit",9,expect='1')
+sql("insert into public.pdi_pcp_daily(pcp_id,m2_saved) values(auth.uid(),0)",1,error='pdi_pcp_one_entry_per_day')
+sql("insert into public.pdi_pcp_daily(pcp_id,m2_saved) values('00000000-0000-0000-0000-000000000002',0)",1,error='próprio resultado de hoje')
+sql("insert into public.pdi_pcp_daily(pcp_id,work_date,m2_saved) values(auth.uid(),current_date-2,0)",2,error='próprio resultado de hoje')
+sql("insert into public.pdi_pcp_daily(pcp_id,m2_saved) values(auth.uid(),0)",8,error='position PCP')
+for m,orders,msg in [('1.1234',"array['12']",'quantidade válida'),('-1',"array['12']",'quantidade válida'),("'NaN'", "array['12']",'quantidade válida'),('2',"'{}'",'pedidos relacionados'),('1',"array['12','12']",'distintos'),('1',"array['abc']",'distintos'),('1',"array[null]",'distintos'),('1',"array_fill('1'::text,array[201])",'distintos')]:
+ sql(f"insert into public.pdi_pcp_daily(pcp_id,m2_saved,order_numbers) values(auth.uid(),{m},{orders})",2,error=msg)
+sql("update public.pdi_pcp_daily set m2_saved=20,edit_reason='Correção solicitada' returning revision",1,expect='UPDATE 0')
+sql("update public.pdi_pcp_daily set m2_saved=20,edit_reason='Correção solicitada' returning revision",5,expect='UPDATE 0')
+sql("update public.pdi_pcp_daily set m2_saved=20,edit_reason='curta'",3,error='justificativa')
+sql("update public.pdi_pcp_daily set m2_saved=12.345,edit_reason='Sem mudança real'",3,error='Não há alteração')
+sql("update public.pdi_pcp_daily set pcp_id='00000000-0000-0000-0000-000000000002',edit_reason='Mudança de pessoa'",3,error='identidade')
+sql("update public.pdi_pcp_daily set m2_saved=15.5,order_numbers=array['00012','991','992'],edit_reason='Auditoria dos pedidos: ajuste confirmado' returning revision",3,expect='2')
+sql("select before_data->>'m2_saved' from public.pdi_performance_audit where action='UPDATE'",4,expect='12.345')
+sql("select after_data->>'m2_saved' from public.pdi_performance_audit where action='UPDATE'",4,expect='15.5')
+sql("select actor_id::text from public.pdi_performance_audit where action='UPDATE'",4,expect='00000000-0000-0000-0000-000000000003')
+sql("update public.pdi_pcp_daily set m2_saved=16,edit_reason='Atualização concorrente' where revision=1 returning id",3,expect='UPDATE 0')
+sql("delete from public.pdi_pcp_daily",3,error='permission denied')
+sql("delete from public.pdi_performance_audit",6,error='permission denied')
+sql("update public.pdi_performance_audit set reason='apagar'",6,error='permission denied')
+sql("insert into public.pdi_performance_audit(entry_id,pcp_id,action,database_actor) values(gen_random_uuid(),auth.uid(),'INSERT','fake')",6,error='permission denied')
+for change in ["role='gerente'",'is_master=true',"position='PCP'","sector='PRODUÇÃO'",'is_professor=true']:
+ sql('update public.profiles set '+change+' where id=auth.uid()',8,error='campos de acesso')
+sql("update public.profiles set full_name='Meu nome',avatar_url='https://example.test/a.png' where id=auth.uid()",1,expect='UPDATE 1')
+sql("update public.profiles set full_name='Outro nome' where id='00000000-0000-0000-0000-000000000002'",1,error='campos de acesso')
+sql("update public.profiles set position='PCP' where id='00000000-0000-0000-0000-000000000008'",3,error='campos de acesso')
+sql("insert into public.profiles(id,role,sector,position) values('00000000-0000-0000-0000-000000000010','employee','PRODUÇÃO','PCP')",4)
+sql("update public.profiles set role='diretoria' where id='00000000-0000-0000-0000-000000000010'",4,error='campos de acesso')
+sql("update public.profiles set position='PCP' where id='00000000-0000-0000-0000-000000000008'",6,expect='UPDATE 1')
+sql("insert into public.pdi_pcp_daily(pcp_id,m2_saved) values(auth.uid(),0)",2)
+sql("select count(*) from public.pdi_pcp_daily",1,expect='1')
+sql("select count(*) from public.pdi_pcp_daily",2,expect='1')
+sql("set local role anon;select count(*) from public.pdi_pcp_daily",error='permission denied')
+sql("set local role anon;select public.pdi_desempenho_context()",error='permission denied')
+sql("delete from public.pdi_pcp_daily where pcp_id='00000000-0000-0000-0000-000000000002'")
+sql("select count(*) from public.pdi_performance_audit where action='DELETE'",4,expect='1')
+print(f'{len(passed)} verificações de banco aprovadas.')
